@@ -1,0 +1,10 @@
+---
+- name: restart ntp
+  systemd:
+    name: ntp
+    state: restarted
+
+- name: restart ssh
+  systemd:
+    name: ssh
+    state: restarted
