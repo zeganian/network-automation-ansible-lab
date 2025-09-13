@@ -1,0 +1,9 @@
+---
+- name: Setup dasar untuk semua node laboratorium
+  hosts: lab_nodes
+  become: yes
+  gather_facts: yes
+
+  roles:
+    - role: common
+      tags: common
