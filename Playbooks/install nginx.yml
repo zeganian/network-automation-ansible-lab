@@ -1,0 +1,30 @@
+---
+- name: Install and configure Nginx
+  hosts: web_servers
+  become: yes
+  gather_facts: no  # Nonaktifkan sementara karena mungkin butuh Python
+
+  tasks:
+    - name: Install Python3 if not present
+      raw: test -e /usr/bin/python3 || (apt update && apt install -y python3)
+      changed_when: false
+
+    - name: Gather facts after Python installation
+      setup:
+
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Nginx service
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
