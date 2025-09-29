@@ -1,35 +1,6 @@
----
-- name: Guaranteed Working Connection Test
-  hosts: all
-
+- name: Test koneksi Ansible ke target node
+  hosts: lab_nodes        # harus sama dengan group di Inventory/hosts.ini
+  gather_facts: no
   tasks:
-    - name: Test basic Ansible connectivity
-      ping:
-
-    - name: Get host information
-      command: uname -a
-      register: system_info
-
-    - name: Display system information
-      debug:
-        msg: "System: {{ system_info.stdout }}"
-
-    - name: Test file system access
-      copy:
-        content: "Test from Ansible control node"
-        dest: /tmp/ansible_test.txt
-      register: file_test
-
-    - name: Confirm file creation
-      debug:
-        msg: "File system access: SUCCESS"
-      when: file_test.changed
-
-    - name: Cleanup
-      file:
-        path: /tmp/ansible_test.txt
-        state: absent
-
-    - name: Final success message
-      debug:
-        msg: "✅ All connection tests passed for {{ inventory_hostname }}"
+    - name: Ping target node
+      ansible.builtin.ping:
