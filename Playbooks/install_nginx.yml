@@ -1,55 +1,18 @@
----
-- name: Install and configure Nginx
-  hosts: web_servers
+- hosts: localhost
   become: yes
-  gather_facts: no  # Nonaktifkan sementara karena mungkin butuh Python
-
+  connection: local
   tasks:
-    - name: Install Python3 if not present
-      raw: test -e /usr/bin/python3 || (apt update && apt install -y python3)
-      changed_when: false
-
-    - name: Gather facts after Python installation
-      setup:
-
-    - name: Update apt package cache
+    - name: Update apt cache
       apt:
         update_cache: yes
-        cache_valid_time: 3600
 
-    - name: Install Nginx
+    - name: Install nginx
       apt:
         name: nginx
         state: present
-        update_cache: yes
 
-    - name: Start and enable Nginx service
-      systemd:
+    - name: Start and enable nginx
+      service:
         name: nginx
         state: started
         enabled: yes
-
-    - name: Create custom HTML page
-      copy:
-        content: |
-          <!DOCTYPE html>
-          <html>
-          <head>
-              <title>Welcome to {{ ansible_hostname }}</title>
-          </head>
-          <body>
-              <h1>Success! Nginx is working on {{ ansible_hostname }}</h1>
-              <p>This server is managed by Ansible - Proyek PBL AA204/TIK</p>
-          </body>
-          </html>
-        dest: /var/www/html/index.html
-        owner: www-data
-        group: www-data
-        mode: '0644'
-      notify: restart nginx
-
-  handlers:
-    - name: restart nginx
-      systemd:
-        name: nginx
-        state: restarted
