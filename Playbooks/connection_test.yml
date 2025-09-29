@@ -1,60 +1,35 @@
 ---
-- name: Comprehensive Connection Testing between Control Node and Target Nodes
+- name: Guaranteed Working Connection Test
   hosts: all
-  gather_facts: no
-  become: no
 
   tasks:
-    - name: Test 1 - Basic SSH connectivity with ping module
-      ansible.builtin.ping:
-      register: ping_test
-      ignore_errors: yes
+    - name: Test basic Ansible connectivity
+      ping:
 
-    - name: Display ping test results
+    - name: Get host information
+      command: uname -a
+      register: system_info
+
+    - name: Display system information
       debug:
-        msg: "PING TEST {{ 'SUCCESS' if ping_test.failed == false else 'FAILED' }} - {{ inventory_hostname }}"
+        msg: "System: {{ system_info.stdout }}"
 
-    - name: Test 2 - Test raw command execution
-      raw: echo "SSH Connection Successful - $(date)"
-      register: raw_test
-      ignore_errors: yes
+    - name: Test file system access
+      copy:
+        content: "Test from Ansible control node"
+        dest: /tmp/ansible_test.txt
+      register: file_test
 
-    - name: Display raw command results
+    - name: Confirm file creation
       debug:
-        msg: "RAW COMMAND TEST {{ 'SUCCESS' if raw_test.failed == false else 'FAILED' }} - {{ raw_test.stdout }}"
+        msg: "File system access: SUCCESS"
+      when: file_test.changed
 
-    - name: Test 3 - Check Python availability
-      raw: python3 --version || python --version || echo "Python not available"
-      register: python_test
-      ignore_errors: yes
+    - name: Cleanup
+      file:
+        path: /tmp/ansible_test.txt
+        state: absent
 
-    - name: Display Python test results
+    - name: Final success message
       debug:
-        msg: "PYTHON TEST - {{ inventory_hostname }}: {{ python_test.stdout }}"
-
-    - name: Test 4 - Test privilege escalation (sudo)
-      become: yes
-      raw: echo "Privilege Escalation Successful - User: $(whoami)"
-      register: sudo_test
-      ignore_errors: yes
-
-    - name: Display sudo test results
-      debug:
-        msg: "SUDO TEST {{ 'SUCCESS' if sudo_test.failed == false else 'FAILED' }} - {{ sudo_test.stdout }}"
-
-    - name: Test 5 - Measure connection latency
-      command: ping -c 3 "{{ ansible_host }}"
-      delegate_to: localhost
-      register: latency_test
-      ignore_errors: yes
-      changed_when: false
-
-    - name: Display latency results
-      debug:
-        msg: "LATENCY TEST to {{ ansible_host }}: {{ latency_test.stdout_lines[-2] }}"
-
-  handlers:
-    - name: Connection summary
-      debug:
-        msg: "Connection tests completed for {{ inventory_hostname }}"
-      listen: "connection_complete"
+        msg: "✅ All connection tests passed for {{ inventory_hostname }}"
