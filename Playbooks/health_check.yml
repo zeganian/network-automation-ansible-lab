@@ -1,0 +1,195 @@
+---
+- name: Automated Health Check for Target Nodes
+  hosts: targets
+  gather_facts: yes  # Gather system facts for CPU/mem/disk info
+  become: yes  # Escalate privileges for service checks and commands
+
+  # Pre-execution notification to Telegram
+  pre_tasks:
+    - name: Send start notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"  # From encrypted vault
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "🩺 Memulai Health Check di {{ groups['targets'] | length }} target nodes: {{ inventory_hostname }}..."
+      delegate_to: localhost  # Run on control node
+      run_once: true  # Only once per playbook run
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml  # Load encrypted vars
+
+  tasks:
+    # 1. Disk Space Monitoring
+    - name: Check disk usage
+      ansible.builtin.setup:  # Use built-in setup to gather facts (idempotent, no changes)
+        filter: ansible_mounts  # Focus on mount points
+      register: disk_facts
+
+    - name: Analyze disk usage (warn if >80%)
+      ansible.builtin.set_fact:
+        disk_usage: "{{ disk_facts.ansible_facts.ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_total') | first | int }}"
+        disk_free: "{{ disk_facts.ansible_facts.ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | int }}"
+        disk_percent_used: "{{ ((disk_usage - disk_free) / disk_usage * 100) | round(2) }}"
+      comment: "Calculate root filesystem usage percentage"
+
+    - name: Report disk health
+      ansible.builtin.debug:
+        msg: "Disk usage on {{ inventory_hostname }}: {{ disk_percent_used }}% (Threshold: 80%)"
+      when: disk_percent_used > 80
+      failed_when: disk_percent_used > 90  # Fail if critically high
+      register: disk_alert
+
+    # 2. CPU and Memory Utilization
+    - name: Check CPU and memory usage
+      ansible.builtin.setup:
+        filter: "*cpu*|*mem*"
+      register: cpu_mem_facts
+
+    - name: Calculate CPU load average (1-min)
+      ansible.builtin.set_fact:
+        cpu_load: "{{ cpu_mem_facts.ansible_facts.ansible_processor_vcpus | int }}"
+        load_avg: "{{ cpu_mem_facts.ansible_facts.ansible_loadavg[0] | float }}"
+        cpu_util: "{{ (load_avg / cpu_load * 100) | round(2) if cpu_load > 0 else 0 }}"
+      comment: "Estimate CPU utilization from load average (simple metric; for real-time, consider sar)"
+
+    - name: Check memory usage
+      ansible.builtin.set_fact:
+        mem_total: "{{ cpu_mem_facts.ansible_facts.ansible_memtotal_mb | int }}"
+        mem_free: "{{ cpu_mem_facts.ansible_facts.ansible_memfree_mb | int }}"
+        mem_percent_used: "{{ ((mem_total - mem_free) / mem_total * 100) | round(2) }}"
+      comment: "Calculate memory percentage used"
+
+    - name: Report resource health
+      ansible.builtin.debug:
+        msg: |
+          CPU Util: {{ cpu_util }}% (Threshold: 70%)
+          Mem Util: {{ mem_percent_used }}% (Threshold: 80%)
+      when: cpu_util > 70 or mem_percent_used > 80
+      failed_when: cpu_util > 90 or mem_percent_used > 95  # Critical thresholds
+      register: resource_alert
+
+    # 3. Network Connectivity Check
+    - name: Test network connectivity to gateway (e.g., 8.8.8.8)
+      ansible.builtin.ping:
+        dest: 8.8.8.8  # Google DNS as test endpoint
+      register: net_ping
+      timeout: 5  # Short timeout for quick check
+      comment: "Ping external host to verify outbound connectivity"
+
+    - name: Test internal network (if defined)
+      ansible.builtin.ping:
+        dest: "{{ groups['targets'][0] if groups['targets'] | length > 1 else 'localhost' }}"  # Ping first target or self
+      when: groups['targets'] | length > 1
+      register: internal_ping
+      comment: "Verify internal lab network connectivity"
+
+    - name: Report network health
+      ansible.builtin.debug:
+        msg: "Network check failed on {{ inventory_hostname }}: Ping to 8.8.8.8 {{ 'succeeded' if net_ping is succeeded else 'failed' }}"
+      when: not net_ping is succeeded
+      failed_when: not net_ping is succeeded or (internal_ping is defined and not internal_ping is succeeded)
+      register: net_alert
+
+    # 4. Service Status Monitoring
+    - name: Gather service facts
+      ansible.builtin.service_facts:  # Modern module for service status (replaces old shell commands)
+        services:  # List key services to monitor (customize as needed)
+          - ssh
+          - nginx  # Assuming Nginx from other playbook; add others like apache, mysql
+      comment: "Collect status of critical services"
+
+    - name: Check service statuses
+      ansible.builtin.assert:
+        that:
+          - "ansible_facts.services['ssh.service'].state == 'running'"
+          - "ansible_facts.services['nginx.service'].state == 'running'"  # Fail if not running
+        fail_msg: "Service {{ item }} is not running on {{ inventory_hostname }}"
+        success_msg: "All monitored services are running"
+      loop:
+        - ssh.service
+        - nginx.service
+      when: "'nginx.service' in ansible_facts.services"  # Conditional for optional services
+      register: service_alert
+      ignore_errors: yes  # Continue for partial reporting
+
+  # Post-execution summary and notification
+  post_tasks:
+    - name: Compile health summary
+      ansible.builtin.set_fact:
+        health_status: >-
+          {% if disk_alert is failed or resource_alert is failed or net_alert is failed or service_alert is failed %}
+          WARNING: Issues detected on {{ inventory_hostname }}
+          {% else %}
+          All systems healthy on {{ inventory_hostname }}
+          {% endif %}
+        detailed_report: >-
+          Disk: {{ disk_percent_used }}% | CPU: {{ cpu_util }}% | Mem: {{ mem_percent_used }}% | 
+          Net: {{ 'OK' if net_ping is succeeded else 'FAIL' }} | Services: {{ 'OK' if service_alert is succeeded else 'FAIL' }}
+
+    - name: Send summary notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          🩺 Health Check Selesai untuk {{ inventory_hostname }}:
+          {{ health_status }}
+          Detail: {{ detailed_report }}
+          {% if disk_alert is failed %}Disk Alert: {{ disk_alert.msg }}{% endif %}
+          {% if resource_alert is failed %}Resource Alert: {{ resource_alert.msg }}{% endif %}
+          {% if net_alert is failed %}Net Alert: {{ net_alert.msg }}{% endif %}
+          {% if service_alert is failed %}Service Alert: {{ service_alert.msg }}{% endif %}
+      delegate_to: localhost
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      run_once: false  # Per host for detailed per-node reports
+
+    - name: Final success/failure notification (aggregate)
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          {% if health_status.startswith('All') %}
+          ✅ Health Check BERHASIL untuk semua targets!
+          {% else %}
+          ❌ Health Check GAGAL: Beberapa issues di {{ health_status }}.
+          Error details di atas.
+          {% endif %}
+      delegate_to: localhost
+      run_once: true  # Summary once at end
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      when: inventory_hostname == groups['targets'][-1]  # Only on last host
+
+  # Handlers for common remediation (optional, triggered if needed)
+  handlers:
+    - name: Restart SSH if stopped
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+      listen: restart ssh
+
+    - name: Clean temp files if disk low
+      ansible.builtin.find:
+        paths: /tmp
+        age: "{{ ansible_date_time.epoch | int - 86400 }}"  # Files older than 1 day
+        recurse: no
+      register: temp_files
+      listen: clean disk
+
+    - name: Remove old files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ temp_files.files }}"
+      listen: clean disk
+      when: temp_files.matched > 0

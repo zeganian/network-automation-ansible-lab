@@ -1,0 +1,164 @@
+---
+- name: Compliance and Audit Guide for Target Nodes
+  hosts: targets
+  gather_facts: yes  # Essential for inventory and compliance checks
+  become: yes  # Need sudo for package lists and config reads
+
+  # Vars for customization (e.g., allowed packages for license audit)
+  vars:
+    allowed_packages:  # Whitelist for license compliance (extend as needed)
+      - openssh-server
+      - nginx
+      - htop
+    compliance_checks:
+      - { file: "/etc/ssh/sshd_config", rule: "PermitRootLogin no", desc: "Root login disabled" }
+      - { service: "ufw", state: "enabled", desc: "Firewall active" }
+    report_dir: "/var/log/audit"  # Local report storage
+
+  # Pre-execution notification
+  pre_tasks:
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+      comment: "Create dir for audit reports"
+
+    - name: Send start notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "📋 Memulai audit kepatuhan di {{ inventory_hostname }}..."
+      delegate_to: localhost
+      run_once: false
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+  tasks:
+    # 1. Pengumpulan Inventaris Sistem
+    - name: Collect system inventory facts
+      ansible.builtin.setup:  # Built-in for hardware/OS/packages facts
+        filter: "*packages*|*hardware*|*os*"
+      register: inventory_facts
+      comment: "Gather comprehensive inventory (OS, packages, hardware)"
+
+    # 2. Audit Lisensi Perangkat Lunak
+    - name: List installed packages
+      ansible.builtin.shell: apt list --installed  # For Debian; use 'rpm -qa' for RHEL
+        | grep -v "Listing..." | cut -d/ -f1
+      register: installed_packages
+      changed_when: false  # Read-only
+      when: ansible_os_family == "Debian"
+      comment: "Fetch installed package names for license check"
+
+    - name: Check for unauthorized packages
+      ansible.builtin.set_fact:
+        unauthorized_pkgs: "{{ installed_packages.stdout_lines | difference(allowed_packages) }}"
+      comment: "Identify packages not in whitelist (simple license proxy)"
+
+    - name: Report license compliance
+      ansible.builtin.assert:
+        that: "unauthorized_pkgs | length == 0"
+        fail_msg: "Unauthorized packages found: {{ unauthorized_pkgs | join(', ') }} (Check licenses!)"
+        success_msg: "All packages compliant with allowed list."
+      register: license_audit
+      comment: "Fail if non-compliant; log for audit"
+
+    # 3. Pemeriksaan Kepatuhan Konfigurasi
+    - name: Check config compliance rules
+      ansible.builtin.lineinfile:
+        path: "{{ item.file }}"
+        regexp: "{{ item.rule | regex_escape }}"
+        state: absent  # Just check, no change
+      loop: "{{ compliance_checks }}"
+      register: config_check
+      failed_when: false  # Continue for full report
+      check_mode: yes  # Dry-run check
+      comment: "Verify config rules (e.g., SSH hardening)"
+
+    - name: Check service compliance
+      ansible.builtin.service_facts:  # For service states
+      register: service_facts
+
+    - name: Validate service states
+      ansible.builtin.assert:
+        that: "ansible_facts.services['{{ item.service }}.service'].state == '{{ item.state }}'"
+        fail_msg: "{{ item.desc }} not compliant on {{ inventory_hostname }}"
+      loop: "{{ compliance_checks | selectattr('service') | list }}"
+      when: "item.service in ansible_facts.services"
+      register: service_compliance
+      ignore_errors: yes  # Partial compliance reporting
+      comment: "Ensure services meet standards"
+
+    # 4. Pembuatan Laporan Sistem
+    - name: Generate compliance report
+      ansible.builtin.copy:
+        content: |
+          Audit Report for {{ inventory_hostname }} - {{ ansible_date_time.date }}
+          =====================================
+          Inventory Summary:
+          - OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          - CPU: {{ ansible_processor_vcpus }} cores
+          - Memory: {{ ansible_memtotal_mb }} MB
+          - Installed Packages: {{ installed_packages.stdout_lines | length }} total
+
+          License Audit:
+          {% if license_audit is succeeded %}
+          ✅ Compliant: All {{ allowed_packages | length }} allowed packages present.
+          {% else %}
+          ❌ Non-compliant: {{ unauthorized_pkgs | join(', ') }}
+          {% endif %}
+
+          Config Compliance:
+          {% for check in config_check.results %}
+          - {{ check.item.desc | default(check.item.file) }}: {{ 'PASS' if check is not changed else 'FAIL' }}
+          {% endfor %}
+          {% if service_compliance is failed %}
+          Service Issues: {{ service_compliance.msg }}
+          {% endif %}
+
+          Full Inventory: {{ inventory_facts.ansible_facts | to_nice_yaml }}
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_compliance_{{ ansible_date_time.epoch }}.txt"
+        backup: yes
+      comment: "Create text report with facts and results"
+
+  # Post-execution notification
+  post_tasks:
+    - name: Send per-node result to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          📋 Audit Selesai untuk {{ inventory_hostname }}:
+          {% if license_audit is failed or service_compliance is failed %}
+          ❌ Non-compliant: {{ license_audit.msg | default('') }} {{ service_compliance.msg | default('') }}
+          {% else %}
+          ✅ Fully compliant! Report saved to {{ report_dir }}.
+          {% endif %}
+          Unauthorized pkgs: {{ unauthorized_pkgs | default('None') | join(', ') }}
+      delegate_to: localhost
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+    - name: Final aggregate notification
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "📈 Audit BERHASIL untuk {{ ansible_play_hosts_all | length }} nodes. Laporan tersedia!"
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      when: inventory_hostname == groups['targets'][-1]

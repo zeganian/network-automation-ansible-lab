@@ -1,0 +1,129 @@
+---
+- name: Basic System Configuration on Target Nodes
+  hosts: targets
+  gather_facts: yes  # Gather facts for OS-specific tasks
+  become: yes  # Need sudo for config changes
+
+  # Pre-execution notification
+  pre_tasks:
+    - name: Send start notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "⚙️ Memulai konfigurasi dasar di {{ groups['targets'] | length }} target nodes..."
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+  tasks:
+    # 1. Update and Upgrade Packages
+    - name: Update package cache
+      ansible.builtin.apt:  # Assuming Debian/Ubuntu; use 'dnf' for RHEL if needed
+        update_cache: yes
+        cache_valid_time: 3600  # Cache valid 1 hour
+      when: ansible_os_family == "Debian"
+      comment: "Refresh apt cache idempotently"
+
+    - name: Upgrade all packages (safe mode: dist, not full)
+      ansible.builtin.apt:
+        upgrade: dist  # Upgrades packages, not kernel (safer for lab)
+        autoremove: yes  # Clean unused deps
+      when: ansible_os_family == "Debian"
+      register: upgrade_result
+      comment: "Perform dist upgrade with autoremove for cleanliness"
+
+    # 2. Set System Timezone (e.g., Asia/Jakarta for Indonesia lab)
+    - name: Set timezone to Asia/Jakarta
+      ansible.builtin.timezone:
+        name: Asia/Jakarta
+      comment: "Configure timezone idempotently"
+
+    # 3. Create Dedicated User for Automation (non-root)
+    - name: Create ansible user if not exists
+      ansible.builtin.user:
+        name: ansible_user
+        state: present
+        groups: sudo  # Add to sudo group
+        shell: /bin/bash
+        create_home: yes
+        append: yes  # Append to existing groups
+      comment: "Create user for SSH/Ansible access, security best practice"
+
+    - name: Copy SSH authorized key for ansible_user
+      ansible.builtin.authorized_key:
+        user: ansible_user
+        state: present
+        key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"  # Public key from control node
+      comment: "Enable key-based auth (no passwords)"
+
+    # 4. Basic Hardening: Disable Root Login over SSH
+    - name: Disable root login in SSH config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        backup: yes  # Backup original
+      notify: restart sshd  # Trigger handler if changed
+      comment: "Enhance security by disabling direct root SSH"
+
+    # 5. Install Essential Tools (e.g., htop for monitoring)
+    - name: Install basic utilities
+      ansible.builtin.apt:
+        name:
+          - htop
+          - curl
+          - vim
+        state: present
+      when: ansible_os_family == "Debian"
+      comment: "Install common tools without bloat"
+
+  # Post-execution notification
+  post_tasks:
+    - name: Send per-node result to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          ⚙️ Konfigurasi Dasar Selesai untuk {{ inventory_hostname }}:
+          {% if upgrade_result is failed %}❌ Upgrade gagal: {{ upgrade_result.msg }}
+          {% else %}✅ Sukses! Timezone, user, hardening applied.
+          {% endif %}
+      delegate_to: localhost
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+    - name: Final aggregate notification
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          {% set total_hosts = groups['targets'] | length %}
+          {% set success_hosts = ansible_play_hosts_all | select('extract', hostvars, 'is defined') | list | length %}
+          🎉 Konfigurasi Dasar BERHASIL untuk {{ success_hosts }}/{{ total_hosts }} nodes!
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      when: inventory_hostname == groups['targets'][-1]
+
+  # Handlers for changes
+  handlers:
+    - name: Restart SSH daemon
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+      listen: restart sshd
+      comment: "Restart SSH only if config changed"

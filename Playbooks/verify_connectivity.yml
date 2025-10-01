@@ -1,0 +1,97 @@
+---
+- name: Verify Connectivity Between Control and Target Nodes
+  hosts: targets  # Target to all nodes in 'targets' group
+  gather_facts: no  # Skip facts to speed up connectivity-only check
+  become: no  # No privilege needed for connectivity tests
+
+  # Pre-execution notification
+  pre_tasks:
+    - name: Send start notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "🔌 Memulai verifikasi konektivitas ke {{ groups['targets'] | length }} target nodes..."
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+  tasks:
+    # 1. Basic ICMP Ping Test (Network Layer 3)
+    - name: Ping target node from control
+      ansible.builtin.ping:  # Built-in module for ICMP echo
+        data: "Connectivity test from control node"
+      register: ping_result
+      timeout: 5  # Short timeout for quick failure detection
+      comment: "Test basic network reachability via ICMP"
+
+    # 2. SSH Connection Test (Transport Layer)
+    - name: Wait for SSH connection to be available
+      ansible.builtin.wait_for_connection:
+        timeout: 10  # Allow time for SSH startup
+        delay: 2  # Initial delay before retries
+        sleep: 1  # Sleep between retries
+      register: ssh_wait
+      comment: "Verify SSH port 22 is open and responsive (assumes key-based auth)"
+
+    # 3. Optional: Test Localhost Loopback (Self-Check)
+    - name: Test localhost connectivity on target
+      ansible.builtin.ping:
+        data: "Local loopback test"
+      delegate_to: localhost  # Run on the target itself
+      register: local_ping
+      comment: "Ensure target's loopback interface is functional"
+
+    # 4. Aggregate Results
+    - name: Set connectivity status fact
+      ansible.builtin.set_fact:
+        connectivity_ok: >-
+          {{ (ping_result is succeeded) and (ssh_wait is succeeded) and (local_ping is succeeded) }}
+        error_details: >-
+          {% if not ping_result is succeeded %}Ping failed: {{ ping_result.msg }}{% endif %}
+          {% if not ssh_wait is succeeded %}SSH timeout: {{ ssh_wait.msg }}{% endif %}
+          {% if not local_ping is succeeded %}Local ping failed: {{ local_ping.msg }}{% endif %}
+      comment: "Compile overall status for reporting"
+
+  # Post-execution notification and summary
+  post_tasks:
+    - name: Send per-node result to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          🔌 Verifikasi Konektivitas untuk {{ inventory_hostname }}:
+          {% if connectivity_ok %}✅ BERHASIL (Ping, SSH, Local OK)
+          {% else %}❌ GAGAL: {{ error_details }}
+          {% endif %}
+      delegate_to: localhost
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+    - name: Final aggregate notification
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          {% if ansible_play_hosts_all | map('extract', hostvars, 'connectivity_ok') | select('equalto', true) | list | length == groups['targets'] | length %}
+          🎉 Semua konektivitas VERIFIKASI BERHASIL!
+          {% else %}
+          ⚠️ Beberapa konektivitas GAGAL. Cek detail di atas.
+          {% endif %}
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      when: inventory_hostname == groups['targets'][-1]  # Run on last host for summary

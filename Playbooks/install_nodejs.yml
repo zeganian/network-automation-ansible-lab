@@ -1,0 +1,76 @@
+---
+- name: Install Node.js on Target Nodes
+  hosts: targets
+  gather_facts: yes  # Kumpul facts untuk conditional
+  become: yes
+
+  tasks:
+    - name: Kirim notifikasi mulai eksekusi
+      community.general.telegram:
+        token: "{{ telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ chat_id }}"
+        msg: "🚀 Memulai instalasi Node.js di {{ inventory_hostname }}..."
+      vars:
+        telegram_token: "{{ vault_telegram_token }}"  # Dari vault
+        chat_id: "{{ vault_chat_id }}"
+      delegate_to: localhost  # Jalankan di control node
+      run_once: true
+
+    - name: Update apt cache  # Idempotent: hanya jika perlu
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      comment: "Update package cache untuk menghindari error install"
+
+    - name: Install Node.js LTS (v20.x) via nodesource repo  # Best practice: Gunakan official repo, bukan snap
+      ansible.builtin.apt:
+        name:
+          - curl
+          - software-properties-common
+        state: present
+
+    - name: Add NodeSource GPG key
+      ansible.builtin.apt_key:
+        url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+        state: present
+      comment: "Import GPG key untuk keamanan repo"
+
+    - name: Add NodeSource repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://deb.nodesource.com/node_20.x {{ ansible_distribution_release }} main"
+        state: present
+
+    - name: Install Node.js
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+      register: nodejs_install
+
+    - name: Verify Node.js installation
+      ansible.builtin.command: node --version
+      register: node_version
+      changed_when: false
+      failed_when: false  # Handle error gracefully
+
+    - name: Kirim notifikasi sukses/gagal
+      community.general.telegram:
+        token: "{{ telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ chat_id }}"
+        msg: >-
+          {% if nodejs_install is failed %}
+          ❌ Gagal install Node.js di {{ inventory_hostname }}: {{ nodejs_install.msg }}
+          {% elif node_version.rc == 0 %}
+          ✅ Sukses! Node.js {{ node_version.stdout }} terinstall di {{ inventory_hostname }}.
+          {% else %}
+          ⚠️ Node.js gagal verifikasi di {{ inventory_hostname }}: {{ node_version.stderr }}
+          {% endif %}
+      vars:
+        telegram_token: "{{ vault_telegram_token }}"
+        chat_id: "{{ vault_chat_id }}"
+      delegate_to: localhost
+      run_once: false  # Per host untuk detail error
+
+  vars_files:
+    - ../../vars/telegram_vars.yml  # Load vault

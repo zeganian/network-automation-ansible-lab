@@ -1,0 +1,169 @@
+---
+- name: Backup and Recovery Process for Target Nodes
+  hosts: targets
+  gather_facts: yes  # Gather facts for paths and user info
+  become: yes  # Need sudo for /etc and /home access
+
+  # Vars for customization (set via -e or inventory)
+  vars:
+    backup_dir: "/backup"  # Local backup dir; change to remote via rsync dest
+    enable_recovery: false  # Set to true for restore mode
+    configs_to_backup:
+      - /etc/ssh/sshd_config
+      - /etc/hosts
+      - /etc/fstab
+    user_data_paths: ["/home/{{ item }}"]  # Dynamic per user
+    timestamp: "{{ ansible_date_time.epoch }}"  # For unique backups
+
+  # Pre-execution notification
+  pre_tasks:
+    - name: Ensure backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0755'
+      comment: "Create local backup dir if needed"
+
+    - name: Send start notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "💾 Memulai backup/recovery di {{ inventory_hostname }} (Recovery mode: {{ enable_recovery }})..."
+      delegate_to: localhost
+      run_once: false  # Per host
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+  tasks:
+    # 1. Backup Important Configurations
+    - name: Backup critical config files
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ backup_dir }}/configs/{{ inventory_hostname }}_{{ timestamp }}_{{ item | basename }}.bak"
+        remote_src: yes
+        backup: yes  # Incremental backup
+      loop: "{{ configs_to_backup }}"
+      register: config_backup
+      comment: "Backup key /etc files with timestamp for versioning"
+
+    # 2. System Snapshot (Full Filesystem Cuplikan)
+    - name: Create system snapshot via rsync (exclude /proc, /sys, /dev)
+      ansible.builtin.synchronize:
+        src: /
+        dest: "{{ backup_dir }}/snapshot/{{ inventory_hostname }}_{{ timestamp }}/"
+        rsync_opts:
+          - "--exclude=/proc/*"
+          - "--exclude=/sys/*"
+          - "--exclude=/dev/*"
+          - "--exclude=/tmp/*"
+          - "--delete"  # Mirror changes
+        archive: yes  # Preserve permissions/timestamps
+      register: snapshot_result
+      comment: "Rsync-based snapshot for quick recovery; idempotent for incremental"
+
+    # 3. Backup User Data (if needed)
+    - name: Get list of users for data backup
+      ansible.builtin.getent:
+        database: passwd
+        key: ""
+      register: users
+      comment: "Fetch non-system users"
+
+    - name: Backup user home directories
+      ansible.builtin.archive:
+        path: "{{ item.user.name }}/home/*"  # /home/<user>/*
+        dest: "{{ backup_dir }}/user_data/{{ inventory_hostname }}_{{ timestamp }}_{{ item.user.name }}.tar.gz"
+        format: gz
+      loop: "{{ users.ansible_facts.getent_passwd | dict2items }}"
+      loop_control:
+        label: "{{ item.user.name }}"
+      when: 
+        - item.user.uid >= 1000  # Non-system users only
+        - item.user.name != "nobody"  # Skip special
+      register: user_backup
+      comment: "Tar.gz user data for portability"
+
+    # 4. Recovery Tasks (Conditional)
+    - name: Restore configs from latest backup
+      ansible.builtin.copy:
+        src: "{{ backup_dir }}/configs/{{ inventory_hostname }}_latest_{{ item | basename }}.bak"  # Assume 'latest' symlink created post-backup
+        dest: "{{ item }}"
+        remote_src: yes
+        backup: yes
+      loop: "{{ configs_to_backup }}"
+      when: enable_recovery
+      register: recovery_config
+      comment: "Restore configs; run with -e enable_recovery=true"
+
+    - name: Restore user data
+      ansible.builtin.unarchive:
+        src: "{{ backup_dir }}/user_data/{{ inventory_hostname }}_latest_{{ item.user.name }}.tar.gz"
+        dest: "/home/{{ item.user.name }}"
+        remote_src: yes
+      loop: "{{ users.ansible_facts.getent_passwd | dict2items }}"
+      loop_control:
+        label: "{{ item.user.name }}"
+      when: 
+        - enable_recovery
+        - item.user.uid >= 1000
+      register: recovery_user
+      comment: "Extract user data backups"
+
+  # Post-execution notification
+  post_tasks:
+    - name: Create symlink for latest backup
+      ansible.builtin.file:
+        src: "{{ backup_dir }}/configs/{{ inventory_hostname }}_{{ timestamp }}_{{ item | basename }}.bak"
+        dest: "{{ backup_dir }}/configs/{{ inventory_hostname }}_latest_{{ item | basename }}.bak"
+        state: link
+      loop: "{{ configs_to_backup }}"
+      comment: "Symlink for easy recovery access"
+
+    - name: Send per-node result to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          💾 Backup/Recovery Selesai untuk {{ inventory_hostname }}:
+          {% if config_backup is failed or snapshot_result is failed or user_backup is failed %}
+          ❌ Gagal: {{ config_backup.msg | default('') }} {{ snapshot_result.msg | default('') }}
+          {% elif enable_recovery %}
+          🔄 Recovery applied sukses!
+          {% else %}
+          ✅ Backup sukses! Files di {{ backup_dir }}.
+          {% endif %}
+      delegate_to: localhost
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+    - name: Final aggregate notification
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "📊 Backup BERHASIL untuk semua targets ({{ ansible_play_hosts_all | length }} nodes)!"
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      when: inventory_hostname == groups['targets'][-1]
+
+  # Handlers
+  handlers:
+    - name: Restart services after recovery
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+      listen: restart after recovery
+      when: enable_recovery

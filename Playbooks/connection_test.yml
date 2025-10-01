@@ -1,6 +1,0 @@
-- name: Test koneksi Ansible ke target node
-  hosts: lab_nodes        # harus sama dengan group di Inventory/hosts.ini
-  gather_facts: no
-  tasks:
-    - name: Ping target node
-      ansible.builtin.ping:

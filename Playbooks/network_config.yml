@@ -1,0 +1,145 @@
+---
+- name: Network Configuration Guide for Target Nodes
+  hosts: targets
+  gather_facts: yes  # Gather interface facts
+  become: yes  # Need sudo for netplan/ufw
+
+  # Vars for customization (set via -e)
+  vars:
+    static_ip: "192.168.1.{{ ansible_default_ipv4.address | regex_replace('^192\\.168\\.1\\.', '') + '10' }}"  # Dynamic base
+    netmask: "255.255.255.0"
+    gateway: "192.168.1.1"
+    dns_servers: ["8.8.8.8", "8.8.4.4"]
+    interfaces_to_manage: ["ens33"]  # e.g., primary NIC
+    hosts_entries:
+      - { ip: "192.168.1.100", name: "control-node" }
+    routes:
+      - { network: "10.0.0.0", netmask: "255.255.255.0", gateway: "192.168.1.1" }
+
+  # Pre-execution notification
+  pre_tasks:
+    - name: Install netplan if missing (Ubuntu)
+      ansible.builtin.apt:
+        name: netplan.io
+        state: present
+      when: ansible_os_family == "Debian"
+      comment: "Ensure netplan for config"
+
+    - name: Send start notification to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "🌐 Memulai konfigurasi jaringan di {{ inventory_hostname }}..."
+      delegate_to: localhost
+      run_once: false
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+  tasks:
+    # 1. Configure Static IP via Netplan
+    - name: Generate netplan config template
+      ansible.builtin.template:
+        src: netplan.j2  # Assume template file in templates/ with {{ static_ip }}, etc.
+        dest: /etc/netplan/01-netcfg.yaml
+        backup: yes
+      notify: apply netplan
+      comment: "Template for static IP, gateway, DNS; idempotent via changed_when"
+
+    # 2. Manage Network Interfaces (e.g., bring up/down)
+    - name: Enable primary interface
+      ansible.builtin.command: ip link set {{ item }} up
+      loop: "{{ interfaces_to_manage }}"
+      changed_when: false  # Read-only check
+      register: interface_status
+      comment: "Ensure interfaces are up; use nmcli for advanced"
+
+    # 3. Sync /etc/hosts File
+    - name: Update /etc/hosts with lab entries
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ item.ip }} {{ item.name }}"
+        state: present
+        backup: yes
+      loop: "{{ hosts_entries }}"
+      notify: flush hosts cache if needed
+      comment: "Sync hosts for name resolution in lab"
+
+    # 4. Configure Routing Table
+    - name: Add static routes
+      ansible.builtin.iproute:
+        dest: "{{ item.network }}/{{ item.netmask | ipaddr('prefix') }}"
+        gateway: "{{ item.gateway }}"
+        state: present
+      loop: "{{ routes }}"
+      comment: "Idempotent route addition; persists via /etc/network/interfaces if needed"
+
+    # 5. Security: Configure UFW Firewall
+    - name: Allow SSH from control node only
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ groups['control'] | default('192.168.1.0/24') }}"  # Subnet or group
+        port: '22'
+        proto: tcp
+        state: enabled
+      notify: reload ufw
+      comment: "Restrict access for security; enable UFW"
+
+    - name: Deny other inbound
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+      comment: "Default deny policy"
+
+  # Post-execution notification
+  post_tasks:
+    - name: Send per-node result to Telegram
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: >-
+          🌐 Konfigurasi Jaringan Selesai untuk {{ inventory_hostname }}:
+          {% if interface_status is failed %}❌ Interface error: {{ interface_status.msg }}
+          {% else %}✅ Sukses! Static IP {{ static_ip }}, routes, firewall applied.
+          {% endif %}
+      delegate_to: localhost
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+
+    - name: Final aggregate notification
+      community.general.telegram:
+        token: "{{ vault_telegram_token }}"
+        api_method: sendMessage
+        chat_id: "{{ vault_chat_id }}"
+        msg: "🔒 Jaringan dikonfigurasi BERHASIL untuk semua targets!"
+      delegate_to: localhost
+      run_once: true
+      vars:
+        vault_telegram_token: "{{ telegram_token | default('') }}"
+        vault_chat_id: "{{ chat_id | default('') }}"
+      vars_files:
+        - ../../vars/telegram_vars.yml
+      when: inventory_hostname == groups['targets'][-1]
+
+  # Handlers
+  handlers:
+    - name: Apply netplan config
+      ansible.builtin.command: netplan apply
+      listen: apply netplan
+      comment: "Apply changes without reboot"
+
+    - name: Reload UFW
+      community.general.ufw:
+        state: reloaded
+      listen: reload ufw
+
+    - name: Flush hosts cache
+      ansible.builtin.meta: flush_handlers
+      listen: flush hosts cache if needed
