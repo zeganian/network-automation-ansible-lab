@@ -1,74 +1,80 @@
 #!/usr/bin/env python3
-# Telegram Bot for Triggering Ansible Playbooks
-# Best practice: Use async untuk scalability, handle errors gracefully.
-# Install: pip install python-telegram-bot==21.0
-
-import asyncio
+import os
 import subprocess
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from ansible.module_utils.common.text import to_native  # Import Ansible utils jika perlu
-import os
 
-# Load vars from Ansible Vault? Simpan di env untuk simplicity.
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')  # Set env: export TELEGRAM_TOKEN=...
-CHAT_ID = int(os.getenv('CHAT_ID'))  # Export CHAT_ID=...
+# --- Konfigurasi dasar ---
+BASE_DIR = Path(__file__).resolve().parent.parent  # root project
+INVENTORY = BASE_DIR / "Inventory" / "hosts.ini"
 
+# Mapping command Telegram ke playbook
 PLAYBOOKS = {
-    'install_nodejs': 'playbooks/install_nodejs.yml',
-    'verify_connectivity': 'playbooks/verify_connectivity.yml',
-    'basic_config': 'playbooks/basic_config.yml',
-    'health_check': 'playbooks/health_check.yml',
-    'backup_recovery': 'playbooks/backup_recovery.yml',
-    'network_config': 'playbooks/network_config.yml',
-    'compliance_audit': 'playbooks/compliance_audit.yml',
-    'install_nginx': 'playbooks/install_nginx.yml',
+    "install_nginx": BASE_DIR / "Playbooks" / "install_nginx.yml",
+    "remove_nginx": BASE_DIR / "Playbooks" / "uninstall_nginx.yml",
+    "verify_connectivity": BASE_DIR / "Playbooks" / "verify_connectivity.yml"
 }
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Halo! Kirim /<playbook_name> untuk jalankan, e.g., /install_nodejs")
+# Token, Chat ID, dan sudo password dari environment
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+BECOME_PASS = os.getenv("BECOME_PASS")  # <--- tambahkan ini
 
-async def run_playbook(update: Update, context: ContextTypes.DEFAULT_TYPE, playbook_name: str):
-    playbook_path = PLAYBOOKS.get(playbook_name)
-    if not playbook_path:
-        await update.message.reply_text(f"Playbook '{playbook_name}' tidak ditemukan!")
-        return
-    
-    await update.message.reply_text(f"Memulai eksekusi {playbook_name}...")
-    
-    try:
-        # Jalankan ansible-playbook dengan vault pass via env atau file
+if not TOKEN or not CHAT_ID:
+    raise EnvironmentError("❌ TELEGRAM_TOKEN dan CHAT_ID harus di-set di environment!")
+
+# --- Fungsi handler command ---
+async def run_playbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command = update.message.text.strip("/")
+
+    if command in PLAYBOOKS:
+        playbook_path = PLAYBOOKS[command]
+
         cmd = [
-            'ansible-playbook', playbook_path, '-i', 'inventory.ini',
-            '--vault-id', '@prompt'  # Atau gunakan --vault-password-file
+            "ansible-playbook",
+            str(playbook_path),
+            "-i", str(INVENTORY),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = to_native(result.stdout) if 'to_native' in globals() else result.stdout
-        await context.bot.send_message(chat_id=CHAT_ID, text=f"✅ Sukses: {playbook_name}\nOutput: {output[:500]}...")  # Truncate jika panjang
-    except subprocess.CalledProcessError as e:
-        error_msg = to_native(e.stderr) if 'to_native' in globals() else e.stderr
-        await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Gagal: {playbook_name}\nError: {error_msg[:500]}...")
-        await update.message.reply_text(f"Gagal jalankan {playbook_name}: {error_msg[:200]}...")
 
-# Handlers untuk setiap command
-async def install_nodejs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await run_playbook(update, context, 'install_nodejs')
+        # jika ada sudo password, kita pakai --extra-vars
+        if BECOME_PASS:
+            cmd += ["--extra-vars", f"ansible_become_pass={BECOME_PASS}"]
+        else:
+            cmd.append("--ask-become-pass")
 
-# ... (Tambah handler serupa untuk setiap playbook, e.g., async def verify_connectivity(...))
+        await update.message.reply_text(f"▶️ Menjalankan playbook: {command} ...")
 
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            output = result.stdout.strip()
+            # batasi panjang agar chat Telegram tidak kepanjangan
+            if len(output) > 700:
+                output = output[:700] + "\n...\n(log dipotong)"
+            await update.message.reply_text(f"✅ Sukses: {command}\n\n{output}")
+        except subprocess.CalledProcessError as e:
+            error = e.stderr.strip()
+            if len(error) > 700:
+                error = error[:700] + "\n...\n(log dipotong)"
+            await update.message.reply_text(f"❌ Gagal: {command}\n\n{error}")
+    else:
+        await update.message.reply_text("⚠️ Command tidak dikenal.")
+
+# --- Main Bot ---
 def main():
-    if not TELEGRAM_TOKEN:
-        print("Set TELEGRAM_TOKEN env var!")
-        return
-    
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("install_nodejs", install_nodejs))
-    app.add_handler(CommandHandler("verify_connectivity", verify_connectivity))
-    # Tambah untuk yang lain: basic_config, health_check, dll.
-    
-    print("Bot berjalan... Tekan Ctrl+C untuk stop.")
+    app = Application.builder().token(TOKEN).build()
+
+    # Register semua command playbook
+    for cmd in PLAYBOOKS.keys():
+        app.add_handler(CommandHandler(cmd, run_playbook))
+
+    print("🤖 Bot berjalan... (CTRL+C untuk berhenti)")
     app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
