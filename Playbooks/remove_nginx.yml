@@ -1,0 +1,38 @@
+---
+- name: Remove Nginx from Ubuntu targets
+  hosts: lab_nodes
+  become: yes
+  become_method: sudo
+
+  tasks:
+    - name: Stop Nginx service
+      systemd:
+        name: nginx
+        state: stopped
+        enabled: no
+
+    - name: Remove Nginx package
+      apt:
+        name: nginx
+        state: absent
+        purge: yes
+        autoremove: yes
+
+    - name: Remove Nginx configuration files
+      file:
+        path: /etc/nginx
+        state: absent
+      ignore_errors: yes
+
+    - name: Remove Nginx log files
+      file:
+        path: /var/log/nginx
+        state: absent
+      ignore_errors: yes
+
+    - name: Remove UFW rule for Nginx
+      ufw:
+        rule: deny
+        port: '80'
+        proto: tcp
+      ignore_errors: yes
