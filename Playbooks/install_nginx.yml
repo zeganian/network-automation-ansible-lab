@@ -1,160 +1,31 @@
 ---
-- name: Install and Configure Nginx on Target Nodes
-  hosts: targets
-  gather_facts: yes  # For OS-specific install
-  become: yes  # Need sudo for package/service
-
-  # Vars for customization
-  vars:
-    enable_https: true  # Set false to skip SSL setup
-    nginx_port: 80
-    server_name: "{{ inventory_hostname }}.lab"  # Dynamic per host
-
-  # Pre-execution notification
-  pre_tasks:
-    - name: Send start notification to Telegram
-      community.general.telegram:
-        token: "{{ vault_telegram_token }}"
-        api_method: sendMessage
-        chat_id: "{{ vault_chat_id }}"
-        msg: "🐳 Memulai instalasi Nginx di {{ inventory_hostname }}..."
-      delegate_to: localhost
-      run_once: false
-      vars:
-        vault_telegram_token: "{{ telegram_token | default('') }}"
-        vault_chat_id: "{{ chat_id | default('') }}"
-      vars_files:
-        - ../../vars/telegram_vars.yml
+- name: Deploy Nginx to Ubuntu targets and measure time
+  hosts: lab_nodes
+  become: yes
+  become_method: sudo
 
   tasks:
-    # 1. Install Nginx
-    - name: Update apt cache
-      ansible.builtin.apt:
+    - name: Update apt package cache
+      apt:
         update_cache: yes
-      when: ansible_os_family == "Debian"
-      comment: "Refresh cache before install"
+      changed_when: false
 
-    - name: Install Nginx from official repo
-      ansible.builtin.apt:
+    - name: Install Nginx
+      apt:
         name: nginx
         state: present
-        update_cache: yes
-      register: nginx_install
-      comment: "Install latest stable Nginx (idempotent)"
 
-    # 2. Basic Configuration
-    - name: Copy Nginx server block template
-      ansible.builtin.template:
-        src: nginx.conf.j2  # Template with {{ server_name }}, {{ nginx_port }}, HTTPS if enabled
-        dest: /etc/nginx/sites-available/{{ server_name }}
-        backup: yes
-      notify: restart nginx
-      comment: "Deploy secure server block (e.g., listen 80; redirect to 443 if HTTPS)"
-
-    - name: Enable site by linking
-      ansible.builtin.file:
-        src: "/etc/nginx/sites-available/{{ server_name }}"
-        dest: "/etc/nginx/sites-enabled/{{ server_name }}"
-        state: link
-      notify: restart nginx
-      comment: "Symlink for activation"
-
-    - name: Remove default site
-      ansible.builtin.file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-      notify: restart nginx
-      comment: "Disable default for security"
-
-    # 3. HTTPS Setup (Optional)
-    - name: Install certbot for Let's Encrypt (if HTTPS)
-      ansible.builtin.apt:
-        name: certbot python3-certbot-nginx
-        state: present
-      when: enable_https
-      comment: "Prep for auto-SSL"
-
-    - name: Obtain SSL cert (dummy for lab; use real domain in prod)
-      ansible.builtin.command: certbot --nginx -d {{ server_name }} --non-interactive --agree-tos --email admin@lab
-      when: enable_https
-      register: cert_result
-      ignore_errors: yes  # Lab: Use self-signed if no domain
-      changed_when: false  # Certbot is external
-      comment: "Auto-config SSL; error-tolerant for testing"
-
-    # 4. Firewall Rule for Nginx
-    - name: Allow HTTP/HTTPS traffic
-      community.general.ufw:
-        rule: allow
-        port: "{{ nginx_port }}"
-        proto: tcp
-      when: enable_https or nginx_port == 80
-      notify: reload ufw
-      comment: "Open ports securely (UFW)"
-
-    # 5. Start and Enable Service
-    - name: Start and enable Nginx service
-      ansible.builtin.service:
+    - name: Ensure Nginx is running and enabled
+      systemd:
         name: nginx
         state: started
         enabled: yes
-      comment: "Ensure Nginx runs on boot"
 
-    # 6. Verify Installation
-    - name: Test Nginx status
-      ansible.builtin.uri:
-        url: "http://localhost"
-        method: GET
-        status_code: 200
-      register: nginx_test
-      failed_when: false  # Report but continue
-      comment: "Basic health check"
-
-  # Post-execution notification
-  post_tasks:
-    - name: Send per-node result to Telegram
-      community.general.telegram:
-        token: "{{ vault_telegram_token }}"
-        api_method: sendMessage
-        chat_id: "{{ vault_chat_id }}"
-        msg: >-
-          🐳 Nginx Instalasi Selesai untuk {{ inventory_hostname }}:
-          {% if nginx_install is failed %}❌ Gagal: {{ nginx_install.msg }}
-          {% elif nginx_test is failed %}⚠️ Test gagal: {{ nginx_test.msg }}
-          {% else %}
-          ✅ Sukses! Running on port {{ nginx_port }}. HTTPS: {{ enable_https }}.
-          {% endif %}
-      delegate_to: localhost
-      vars:
-        vault_telegram_token: "{{ telegram_token | default('') }}"
-        vault_chat_id: "{{ chat_id | default('') }}"
-      vars_files:
-        - ../../vars/telegram_vars.yml
-
-    - name: Final aggregate notification
-      community.general.telegram:
-        token: "{{ vault_telegram_token }}"
-        api_method: sendMessage
-        chat_id: "{{ vault_chat_id }}"
-        msg: "🌐 Nginx dikonfigurasi BERHASIL untuk semua targets!"
-      delegate_to: localhost
-      run_once: true
-      vars:
-        vault_telegram_token: "{{ telegram_token | default('') }}"
-        vault_chat_id: "{{ chat_id | default('') }}"
-      vars_files:
-        - ../../vars/telegram_vars.yml
-      when: inventory_hostname == groups['targets'][-1]
-
-  # Handlers
-  handlers:
-    - name: Restart Nginx
-      ansible.builtin.service:
-        name: nginx
-        state: restarted
-      listen: restart nginx
-      comment: "Restart only if config changed"
-
+    - name: Configure UFW to allow Nginx
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
     - name: Reload UFW
       community.general.ufw:
         state: reloaded
