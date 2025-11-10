@@ -1,0 +1,55 @@
+---
+- name: Verify and fix missing software on Windows PCs
+  hosts: windows_lab
+  gather_facts: no
+  become: false
+
+  vars:
+    software_list:
+      - name: "Google Chrome"
+        package: "googlechrome"
+      - name: "Visual Studio Code"
+        package: "vscode"
+      - name: "Python 3"
+        package: "python"
+      - name: "Notepad++"
+        package: "notepadplusplus"
+      - name: "Git"
+        package: "git"
+
+  tasks:
+
+    - name: Ensure Chocolatey is installed
+      win_shell: |
+        if (!(Test-Path "$env:ProgramData\chocolatey\bin\choco.exe")) {
+          Set-ExecutionPolicy Bypass -Scope Process -Force;
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072;
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        }
+      args:
+        executable: powershell.exe
+
+    - name: Verify and install software if missing
+      vars:
+        choco_path: "C:\\ProgramData\\chocolatey\\bin\\choco.exe"
+      win_shell: |
+        $pkg = "{{ item.package }}"
+        $check = & "{{ choco_path }}" list --local-only | Select-String $pkg
+        if (-not $check) {
+          Write-Host "Installing {{ item.name }}..."
+          & "{{ choco_path }}" install $pkg -y --no-progress --limit-output --timeout 2700
+        } else {
+          Write-Host "{{ item.name }} already installed."
+        }
+      args:
+        executable: powershell.exe
+      loop: "{{ software_list }}"
+      register: install_results
+      retries: 3
+      delay: 10
+      until: install_results is succeeded
+
+    - name: Display installation results
+      debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ install_results.results }}"
