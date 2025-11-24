@@ -1,76 +1,201 @@
 ---
-- name: Install Node.js on Target Nodes
-  hosts: targets
-  gather_facts: yes  # Kumpul facts untuk conditional
-  become: yes
+- name: Install Node.js on Windows with CPU Monitoring
+  hosts: windows
+  gather_facts: yes
+  
+  vars:
+    nodejs_version: "20.11.1"
+    nodejs_installer_url: "https://nodejs.org/dist/v{{ nodejs_version }}/node-v{{ nodejs_version }}-x64.msi"
+    temp_dir: "C:\\Temp"
+    force_reinstall: false
+
+  pre_tasks:
+    - name: Check if Node.js is already installed
+      ansible.windows.win_command: node --version
+      register: existing_node
+      changed_when: false
+      failed_when: false
+
+    - name: Display existing Node.js version if found
+      ansible.builtin.debug:
+        msg: "⚠️ Node.js {{ existing_node.stdout | trim }} sudah terinstall. Set force_reinstall=true untuk uninstall dulu."
+      when: existing_node.rc == 0 and not force_reinstall
+
+    - name: Uninstall existing Node.js if force_reinstall enabled
+      ansible.windows.win_package:
+        product_id: '{5ABA83F0-49A0-42C9-A3E8-47F80193A9AD}'
+        state: absent
+      when: existing_node.rc == 0 and force_reinstall
+      register: uninstall_result
+      ignore_errors: yes
+
+    - name: Get baseline CPU usage using WMI (no profile interference)
+      ansible.windows.win_shell: |
+        $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+        Write-Output $cpu
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: baseline_cpu
+      changed_when: false
+
+    - name: Get processor count using WMI
+      ansible.windows.win_shell: |
+        $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+        Write-Output $cores
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: cpu_count
+      changed_when: false
+
+    - name: Display baseline CPU information
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "    PLAYBOOK START - Baseline CPU Report"
+          - "============================================================"
+          - "Host              : {{ inventory_hostname }}"
+          - "CPU Usage (Start) : {{ baseline_cpu.stdout | trim }}%"
+          - "Total CPU Cores   : {{ cpu_count.stdout | trim }}"
+          - "============================================================"
+          - ""
 
   tasks:
-    - name: Kirim notifikasi mulai eksekusi
-      community.general.telegram:
-        token: "{{ telegram_token }}"
-        api_method: sendMessage
-        chat_id: "{{ chat_id }}"
-        msg: "🚀 Memulai instalasi Node.js di {{ inventory_hostname }}..."
-      vars:
-        telegram_token: "{{ vault_telegram_token }}"  # Dari vault
-        chat_id: "{{ vault_chat_id }}"
-      delegate_to: localhost  # Jalankan di control node
-      run_once: true
+    - name: Skip installation if Node.js exists and force_reinstall is false
+      ansible.builtin.meta: end_host
+      when: existing_node.rc == 0 and not force_reinstall
 
-    - name: Update apt cache  # Idempotent: hanya jika perlu
-      ansible.builtin.apt:
-        update_cache: yes
-        cache_valid_time: 3600
-      comment: "Update package cache untuk menghindari error install"
+    - name: Create temp directory if not exists
+      ansible.windows.win_file:
+        path: "{{ temp_dir }}"
+        state: directory
 
-    - name: Install Node.js LTS (v20.x) via nodesource repo  # Best practice: Gunakan official repo, bukan snap
-      ansible.builtin.apt:
-        name:
-          - curl
-          - software-properties-common
-        state: present
+    - name: Start CPU monitoring job in background using WMI
+      ansible.windows.win_shell: |
+        $samples = 5
+        $interval = 1
+        $total = 0
+        for ($i = 0; $i -lt $samples; $i++) {
+          Start-Sleep -Seconds $interval
+          $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+          $total += $cpu
+        }
+        $avg = $total / $samples
+        Write-Output $avg
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      async: 30
+      poll: 0
+      register: cpu_monitor_job
+      changed_when: false
 
-    - name: Add NodeSource GPG key
-      ansible.builtin.apt_key:
-        url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
-        state: present
-      comment: "Import GPG key untuk keamanan repo"
+    - name: Download Node.js installer
+      ansible.windows.win_get_url:
+        url: "{{ nodejs_installer_url }}"
+        dest: "{{ temp_dir }}\\nodejs-installer.msi"
+      register: download_result
 
-    - name: Add NodeSource repository
-      ansible.builtin.apt_repository:
-        repo: "deb https://deb.nodesource.com/node_20.x {{ ansible_distribution_release }} main"
-        state: present
-
-    - name: Install Node.js
-      ansible.builtin.apt:
-        name: nodejs
-        state: present
+    - name: Install Node.js using MSI
+      ansible.windows.win_shell: |
+        $msiPath = '{{ temp_dir }}\nodejs-installer.msi'
+        $logPath = '{{ temp_dir }}\nodejs-install.log'
+        $arguments = '/i', $msiPath, '/qn', '/norestart', '/L*V', $logPath
+        $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $arguments -Wait -PassThru -NoNewWindow
+        Write-Output $process.ExitCode
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
       register: nodejs_install
+      changed_when: nodejs_install.stdout | trim == '0'
+      failed_when: nodejs_install.stdout | trim not in ['0', '3010']
 
     - name: Verify Node.js installation
-      ansible.builtin.command: node --version
+      ansible.windows.win_command: node --version
       register: node_version
       changed_when: false
-      failed_when: false  # Handle error gracefully
+      failed_when: false
 
-    - name: Kirim notifikasi sukses/gagal
-      community.general.telegram:
-        token: "{{ telegram_token }}"
-        api_method: sendMessage
-        chat_id: "{{ chat_id }}"
-        msg: >-
-          {% if nodejs_install is failed %}
-          ❌ Gagal install Node.js di {{ inventory_hostname }}: {{ nodejs_install.msg }}
-          {% elif node_version.rc == 0 %}
-          ✅ Sukses! Node.js {{ node_version.stdout }} terinstall di {{ inventory_hostname }}.
-          {% else %}
-          ⚠️ Node.js gagal verifikasi di {{ inventory_hostname }}: {{ node_version.stderr }}
-          {% endif %}
-      vars:
-        telegram_token: "{{ vault_telegram_token }}"
-        chat_id: "{{ vault_chat_id }}"
-      delegate_to: localhost
-      run_once: false  # Per host untuk detail error
+    - name: Wait for CPU monitoring to complete
+      ansible.builtin.async_status:
+        jid: "{{ cpu_monitor_job.ansible_job_id }}"
+      register: cpu_result
+      until: cpu_result.finished
+      retries: 10
+      delay: 3
 
-  vars_files:
-    - ../../vars/telegram_vars.yml  # Load vault
+  post_tasks:
+    - name: Get post-install CPU usage using WMI
+      ansible.windows.win_shell: |
+        $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+        Write-Output $cpu
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: post_cpu
+      changed_when: false
+
+    - name: Calculate CPU metrics
+      ansible.builtin.set_fact:
+        baseline_cpu_value: "{{ baseline_cpu.stdout | trim | float | round(2) }}"
+        during_avg_cpu: "{{ cpu_result.stdout | trim | float | round(2) }}"
+        post_cpu_value: "{{ post_cpu.stdout | trim | float | round(2) }}"
+        cpu_delta: "{{ ((post_cpu.stdout | trim | float) - (baseline_cpu.stdout | trim | float)) | round(2) }}"
+        total_cores: "{{ cpu_count.stdout | trim | int }}"
+
+    - name: Display detailed CPU usage report
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "    PLAYBOOK END - Final CPU Report"
+          - "============================================================"
+          - "Host                  : {{ inventory_hostname }}"
+          - ""
+          - "CPU BEFORE Playbook   : {{ baseline_cpu_value }}%"
+          - "CPU AFTER Playbook    : {{ post_cpu_value }}%"
+          - "CPU Delta             : {{ cpu_delta }}% {% if cpu_delta | float > 0 %}(increased){% elif cpu_delta | float < 0 %}(decreased){% else %}(no change){% endif %}"
+          - ""
+          - "Avg During Install    : {{ during_avg_cpu }}%"
+          - "Total CPU Cores       : {{ total_cores }}"
+          - ""
+          - "Node.js Status        : {% if node_version.rc == 0 %}{{ node_version.stdout | trim }} (SUCCESS){% else %}Installation Failed{% endif %}"
+          - "CPU Impact Level      : {% if cpu_delta | float > 20 %}HIGH - Consider optimization{% elif cpu_delta | float > 10 %}MODERATE{% else %}LOW{% endif %}"
+          - "============================================================"
+          - ""
+
+    - name: Read installation log on failure
+      ansible.windows.win_shell: |
+        if (Test-Path "{{ temp_dir }}\nodejs-install.log") {
+          Get-Content "{{ temp_dir }}\nodejs-install.log" -Tail 50
+        }
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: install_log
+      when: node_version.rc != 0
+      ignore_errors: yes
+
+    - name: Display installation log excerpt if failed
+      ansible.builtin.debug:
+        msg: "{{ install_log.stdout_lines }}"
+      when: node_version.rc != 0 and install_log.stdout_lines is defined
+
+    - name: Cleanup installer file
+      ansible.windows.win_file:
+        path: "{{ temp_dir }}\\nodejs-installer.msi"
+        state: absent
+      when: download_result is succeeded
+
+    - name: Send aggregate summary
+      ansible.builtin.debug:
+        msg: "Windows Installation Complete - Avg CPU Impact: {{ cpu_delta }}%"
+      run_once: true
+      when: inventory_hostname == groups['windows'][-1]
+      
