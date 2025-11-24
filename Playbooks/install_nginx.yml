@@ -1,32 +1,281 @@
 ---
-- name: Deploy Nginx to Ubuntu targets and measure time
-  hosts: lab_nodes
-  become: yes
-  become_method: sudo
+- name: Install Nginx on Windows with CPU Monitoring
+  hosts: windows
+  gather_facts: yes
+  
+  vars:
+    nginx_version: "1.26.2"
+    nginx_download_url: "http://nginx.org/download/nginx-{{ nginx_version }}.zip"
+    nginx_install_dir: "C:\\nginx"
+    temp_dir: "C:\\Temp"
+    force_reinstall: false
 
-  tasks:
-    - name: Update apt package cache
-      apt:
-        update_cache: yes
+  pre_tasks:
+    - name: Check if Nginx is already installed
+      ansible.windows.win_stat:
+        path: "{{ nginx_install_dir }}\\nginx.exe"
+      register: existing_nginx
+
+    - name: Get existing Nginx version if installed
+      ansible.windows.win_shell: |
+        & "{{ nginx_install_dir }}\nginx.exe" -v 2>&1
+      register: nginx_version_check
+      when: existing_nginx.stat.exists
+      changed_when: false
+      failed_when: false
+
+    - name: Display existing Nginx installation if found
+      ansible.builtin.debug:
+        msg: "Nginx sudah terinstall di {{ nginx_install_dir }}. Set force_reinstall=true untuk install ulang."
+      when: existing_nginx.stat.exists and not force_reinstall
+
+    - name: Stop Nginx service if running
+      ansible.windows.win_shell: |
+        $process = Get-Process nginx -ErrorAction SilentlyContinue
+        if ($process) {
+          & "{{ nginx_install_dir }}\nginx.exe" -s stop
+          Start-Sleep -Seconds 2
+        }
+      when: existing_nginx.stat.exists and force_reinstall
+      ignore_errors: yes
+
+    - name: Remove existing Nginx installation if force_reinstall enabled
+      ansible.windows.win_file:
+        path: "{{ nginx_install_dir }}"
+        state: absent
+      when: existing_nginx.stat.exists and force_reinstall
+
+    - name: Get baseline CPU usage using WMI
+      ansible.windows.win_shell: |
+        $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+        Write-Output $cpu
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: baseline_cpu
       changed_when: false
 
-    - name: Install Nginx
-      apt:
-        name: nginx
-        state: present
+    - name: Get processor count using WMI
+      ansible.windows.win_shell: |
+        $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+        Write-Output $cores
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: cpu_count
+      changed_when: false
 
-    - name: Ensure Nginx is running and enabled
-      systemd:
-        name: nginx
-        state: started
+    - name: Display baseline CPU information
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "    PLAYBOOK START - Baseline CPU Report"
+          - "============================================================"
+          - "Host              : {{ inventory_hostname }}"
+          - "CPU Usage (Start) : {{ baseline_cpu.stdout | trim }}%"
+          - "Total CPU Cores   : {{ cpu_count.stdout | trim }}"
+          - "============================================================"
+          - ""
+
+  tasks:
+    - name: Skip installation if Nginx exists and force_reinstall is false
+      ansible.builtin.meta: end_host
+      when: existing_nginx.stat.exists and not force_reinstall
+
+    - name: Create temp directory if not exists
+      ansible.windows.win_file:
+        path: "{{ temp_dir }}"
+        state: directory
+
+    - name: Start CPU monitoring job in background using WMI
+      ansible.windows.win_shell: |
+        $samples = 5
+        $interval = 1
+        $total = 0
+        for ($i = 0; $i -lt $samples; $i++) {
+          Start-Sleep -Seconds $interval
+          $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+          $total += $cpu
+        }
+        $avg = $total / $samples
+        Write-Output $avg
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      async: 30
+      poll: 0
+      register: cpu_monitor_job
+      changed_when: false
+
+    - name: Download Nginx ZIP file
+      ansible.windows.win_get_url:
+        url: "{{ nginx_download_url }}"
+        dest: "{{ temp_dir }}\\nginx-{{ nginx_version }}.zip"
+      register: download_result
+
+    - name: Extract Nginx ZIP to C drive
+      community.windows.win_unzip:
+        src: "{{ temp_dir }}\\nginx-{{ nginx_version }}.zip"
+        dest: "C:\\"
+        creates: "C:\\nginx-{{ nginx_version }}"
+      register: extract_result
+
+    - name: Rename extracted folder to nginx
+      ansible.windows.win_shell: |
+        if (Test-Path "C:\nginx-{{ nginx_version }}") {
+          if (Test-Path "{{ nginx_install_dir }}") {
+            Remove-Item "{{ nginx_install_dir }}" -Recurse -Force
+          }
+          Rename-Item -Path "C:\nginx-{{ nginx_version }}" -NewName "nginx"
+        }
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+
+    - name: Create Nginx logs directory
+      ansible.windows.win_file:
+        path: "{{ nginx_install_dir }}\\logs"
+        state: directory
+
+    - name: Backup original Nginx config
+      ansible.windows.win_copy:
+        src: "{{ nginx_install_dir }}\\conf\\nginx.conf"
+        dest: "{{ nginx_install_dir }}\\conf\\nginx.conf.bak"
+        remote_src: yes
+
+    - name: Configure Nginx to run on port 8080 (avoid conflicts)
+      ansible.windows.win_shell: |
+        $nginxDir = '{{ nginx_install_dir }}'
+        $configPath = Join-Path $nginxDir 'conf\nginx.conf'
+        if (Test-Path $configPath) {
+          $content = Get-Content $configPath -Raw
+          $content = $content -replace 'listen\s+80;', 'listen       8080;'
+          Set-Content -Path $configPath -Value $content -NoNewline
+          Write-Output "Config updated successfully"
+        } else {
+          Write-Output "Config file not found at $configPath"
+          exit 1
+        }
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: config_update
+
+    - name: Add Nginx to Windows Firewall
+      community.windows.win_firewall_rule:
+        name: "Nginx HTTP"
+        localport: 8080
+        action: allow
+        direction: in
+        protocol: tcp
+        state: present
         enabled: yes
 
-    - name: Configure UFW to allow Nginx
-      ufw:
-        rule: allow
-        port: '80'
-        proto: tcp
-    - name: Reload UFW
-      community.general.ufw:
-        state: reloaded
-      listen: reload ufw
+    - name: Test Nginx configuration
+      ansible.windows.win_command: "{{ nginx_install_dir }}\\nginx.exe -t"
+      register: nginx_test
+      changed_when: false
+      failed_when: false
+
+    - name: Start Nginx service
+      ansible.windows.win_shell: |
+        Start-Process -FilePath "{{ nginx_install_dir }}\nginx.exe" -WorkingDirectory "{{ nginx_install_dir }}" -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+        $process = Get-Process nginx -ErrorAction SilentlyContinue
+        if ($process) {
+          Write-Output "Nginx started successfully"
+        } else {
+          Write-Output "Failed to start Nginx"
+          exit 1
+        }
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: nginx_start
+      when: nginx_test.rc == 0
+
+    - name: Verify Nginx is running
+      ansible.windows.win_shell: |
+        $process = Get-Process nginx -ErrorAction SilentlyContinue
+        if ($process) {
+          Write-Output "Running"
+        } else {
+          Write-Output "Not Running"
+        }
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: nginx_status
+      changed_when: false
+
+    - name: Wait for CPU monitoring to complete
+      ansible.builtin.async_status:
+        jid: "{{ cpu_monitor_job.ansible_job_id }}"
+      register: cpu_result
+      until: cpu_result.finished
+      retries: 10
+      delay: 3
+
+  post_tasks:
+    - name: Get post-install CPU usage using WMI
+      ansible.windows.win_shell: |
+        $cpu = Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+        Write-Output $cpu
+      args:
+        executable: powershell.exe
+      environment:
+        PSModulePath: ''
+      register: post_cpu
+      changed_when: false
+
+    - name: Calculate CPU metrics
+      ansible.builtin.set_fact:
+        baseline_cpu_value: "{{ baseline_cpu.stdout | trim | float | round(2) }}"
+        during_avg_cpu: "{{ cpu_result.stdout | trim | float | round(2) }}"
+        post_cpu_value: "{{ post_cpu.stdout | trim | float | round(2) }}"
+        cpu_delta: "{{ ((post_cpu.stdout | trim | float) - (baseline_cpu.stdout | trim | float)) | round(2) }}"
+        total_cores: "{{ cpu_count.stdout | trim | int }}"
+
+    - name: Display detailed CPU usage report
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "    PLAYBOOK END - Final CPU Report"
+          - "============================================================"
+          - "Host                  : {{ inventory_hostname }}"
+          - ""
+          - "CPU BEFORE Playbook   : {{ baseline_cpu_value }}%"
+          - "CPU AFTER Playbook    : {{ post_cpu_value }}%"
+          - "CPU Delta             : {{ cpu_delta }}% {% if cpu_delta | float > 0 %}(increased){% elif cpu_delta | float < 0 %}(decreased){% else %}(no change){% endif %}"
+          - ""
+          - "Avg During Install    : {{ during_avg_cpu }}%"
+          - "Total CPU Cores       : {{ total_cores }}"
+          - ""
+          - "Nginx Status          : {% if nginx_status.stdout | trim == 'Running' %}{{ nginx_status.stdout | trim }} (SUCCESS){% else %}Not Running (FAILED){% endif %}"
+          - "Nginx Location        : {{ nginx_install_dir }}"
+          - "Nginx Port            : 8080"
+          - "CPU Impact Level      : {% if cpu_delta | float > 20 %}HIGH - Consider optimization{% elif cpu_delta | float > 10 %}MODERATE{% else %}LOW{% endif %}"
+          - "============================================================"
+          - ""
+          - "Access Nginx at: http://{{ ansible_host }}:8080"
+          - "============================================================"
+          - ""
+
+    - name: Cleanup downloaded ZIP file
+      ansible.windows.win_file:
+        path: "{{ temp_dir }}\\nginx-{{ nginx_version }}.zip"
+        state: absent
+      when: download_result is succeeded
+
+    - name: Send aggregate summary
+      ansible.builtin.debug:
+        msg: "Windows Installation Complete - Nginx running on port 8080 - Avg CPU Impact: {{ cpu_delta }}%"
+      run_once: true
+      when: inventory_hostname == groups['windows'][-1]
