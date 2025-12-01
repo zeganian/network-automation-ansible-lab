@@ -1,38 +1,12 @@
 ---
-- name: Remove Nginx from Ubuntu targets
-  hosts: lab_nodes
-  become: yes
-  become_method: sudo
+- name: One-Line Nginx Uninstall
+  hosts: windows
 
   tasks:
-    - name: Stop Nginx service
-      systemd:
-        name: nginx
-        state: stopped
-        enabled: no
+    - name: Uninstall Nginx
+      win_shell: |
+        taskkill /f /im nginx.exe 2>$null; sc.exe delete nginx 2>$null; netsh advfirewall firewall delete rule name="Nginx" 2>$null; Remove-Item "C:\nginx" -Recurse -Force -ErrorAction SilentlyContinue; echo "Nginx uninstalled"
 
-    - name: Remove Nginx package
-      apt:
-        name: nginx
-        state: absent
-        purge: yes
-        autoremove: yes
-
-    - name: Remove Nginx configuration files
-      file:
-        path: /etc/nginx
-        state: absent
-      ignore_errors: yes
-
-    - name: Remove Nginx log files
-      file:
-        path: /var/log/nginx
-        state: absent
-      ignore_errors: yes
-
-    - name: Remove UFW rule for Nginx
-      ufw:
-        rule: deny
-        port: '80'
-        proto: tcp
-      ignore_errors: yes
+    - name: Confirm removal
+      debug:
+        msg: "Nginx has been uninstalled from the system"
